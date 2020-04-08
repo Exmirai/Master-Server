@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"go.inferGopath": true,
+		"go.gopath": "C:/Users/boris/Desktop/Работа/Проги/Master Server"
+	}
+}
