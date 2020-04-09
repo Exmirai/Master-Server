@@ -2,6 +2,7 @@ package swjkja
 
 import (
 	"bufio"
+	"log"
 	"net"
 	"os"
 
@@ -28,7 +29,8 @@ type server_info struct {
 }
 
 type event struct {
-	t       int
+	t       int // 0 - error, 1 - shutdown
+	sender  chan event
 	err     error
 	payload string
 }
@@ -40,7 +42,11 @@ const SERVER_TIMEOUT int64 = 303 * 1000 // msec
 
 var server_list = make([]server_info, 0, MAX_SERVERS)
 var socket *net.UDPConn
+
 var channel_event = make(chan event)
+var channel_command = make(chan event)
+var channel_udp = make(chan event)
+var channel_timeout = make(chan event)
 
 func sendUdpMessage(ip *net.UDPAddr, data []byte) error {
 	var buffer []byte = make([]byte, 4, MSG_MAXLEN)
@@ -52,7 +58,6 @@ func sendUdpMessage(ip *net.UDPAddr, data []byte) error {
 	buffer = append(buffer[:], data[:]...)
 	_, err := socket.WriteToUDP(buffer, ip)
 	if err != nil {
-		fmt.Print(err)
 		return err
 	}
 	return nil
@@ -60,7 +65,7 @@ func sendUdpMessage(ip *net.UDPAddr, data []byte) error {
 
 func infoStringToMap(data string) (map[string]string, error) {
 	if len(data) > MAX_INFOSTRING {
-		return nil, nil
+		return nil, nil //Warning should be there
 	}
 	if (strings.Index(data, "\\")) == 0 {
 		data = data[1:len(data)]
@@ -83,23 +88,31 @@ func MapToInfoString(data map[string]string) (string, error) {
 	return ret, nil
 }
 
-func getInfo(server server_info) {
-	sendUdpMessage(server.ip, []byte(fmt.Sprintf("getinfo %s", server.challenge)))
+func getInfo(server server_info) error {
+	return sendUdpMessage(server.ip, []byte(fmt.Sprintf("getinfo %s", server.challenge)))
 }
 
-func heartbeat(address *net.UDPAddr, data []string) {
+func heartbeat(address *net.UDPAddr, data []string) error {
+	var err error
 	for index, v := range server_list {
 		if v.ip.String() == address.String() { // already have that server in list
 			server_list[index].lastHeartbeat = time.Now()
 			server_list[index].status = 1
-			getInfo(server_list[index])
-			return
+			err = getInfo(server_list[index])
+			if err != nil {
+				return err
+			}
+			return nil
 		}
 	}
 	// Don't found any
 	info := server_info{ip: address, lastHeartbeat: time.Now(), challenge: "ch3114ng3", status: 1}
 	server_list = append(server_list, info)
-	getInfo(server_list[len(server_list)-1]) // getting last
+	err = getInfo(server_list[len(server_list)-1]) // getting last
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func getserversResponse(ip *net.UDPAddr) error {
@@ -108,16 +121,18 @@ func getserversResponse(ip *net.UDPAddr) error {
 	output = append(output[:], []byte("getserversResponse")...)
 	output = append(output[:], []byte("\\")...)
 	for _, v := range server_list {
-		t := make([]byte, 6)
-		p := v.ip.IP.To4()
-		t[0] = p[0]
-		t[1] = p[1]
-		t[2] = p[2]
-		t[3] = p[3]
-		t[4] = byte((v.ip.Port >> 8))
-		t[5] = byte(v.ip.Port)
-		output = append(output[:], t[:]...)
-		output = append(output[:], []byte("\\")...)
+		if v.status == 2 {
+			t := make([]byte, 6)
+			p := v.ip.IP.To4()
+			t[0] = p[0]
+			t[1] = p[1]
+			t[2] = p[2]
+			t[3] = p[3]
+			t[4] = byte((v.ip.Port >> 8))
+			t[5] = byte(v.ip.Port)
+			output = append(output[:], t[:]...)
+			output = append(output[:], []byte("\\")...)
+		}
 	}
 	sendUdpMessage(ip, output)
 	return nil
@@ -128,10 +143,13 @@ func getServers(address *net.UDPAddr, data []string) error {
 }
 
 func infoResponse(address *net.UDPAddr, data []string) error {
-	infostring, _ := infoStringToMap(data[1])
+	var err error
+	infostring, err := infoStringToMap(data[1])
+	if err != nil {
+		return err
+	}
 	for index, info := range server_list {
 		if info.ip.IP.Equal(address.IP) && info.status == 1 {
-			var err error
 			server_list[index].clients, err = strconv.Atoi(infostring["clients"])
 			server_list[index].fdisable, err = strconv.Atoi(infostring["fdisable"])
 			server_list[index].gametype, err = strconv.Atoi(infostring["gametype"])
@@ -140,7 +158,7 @@ func infoResponse(address *net.UDPAddr, data []string) error {
 			server_list[index].protocol, err = strconv.Atoi(infostring["protocol"])
 			server_list[index].sv_maxclients, err = strconv.Atoi(infostring["sv_maxclients"])
 			server_list[index].truejedi, err = strconv.Atoi(infostring["truejedi"])
-			server_list[index].status = 1
+			server_list[index].status = 2
 			if err != nil {
 				return err
 			}
@@ -153,12 +171,22 @@ func rateLimiter(address *net.UDPAddr) error { // leaky bukkit implementation
 	return nil
 }
 
-func processUdpPackets() error {
+func processUdpPackets() {
 	buffer := make([]byte, MSG_MAXLEN)
 	for {
+		select {
+		case event := <-channel_udp:
+			switch event.t {
+			case 0: //error
+			case 1: //shutdown ( from console )
+				return
+			default:
+			}
+		default:
+		}
 		length, address, err := socket.ReadFromUDP(buffer)
 		if err != nil {
-			return err
+			channel_event <- event{t: 0, err: err, sender: channel_udp}
 		}
 		raw := string(buffer[4:length])
 		length = length - 4
@@ -179,29 +207,51 @@ func processUdpPackets() error {
 			getServers(address, data)
 		case "infoResponse":
 			infoResponse(address, data)
+		default:
+			log.Printf("Received unknown message from %s : %s", address.String, buffer)
 		}
 	}
 }
 
-func checkTimeout() error {
-	temp := server_list[:0]
-	for index, info := range server_list {
-		delta := time.Since(info.lastHeartbeat)
-		if delta.Milliseconds() <= SERVER_TIMEOUT {
-			server_list = append(server_list[:index], server_list[index+1:]...) // dead // UNQLSS: Will it break a loop?
-			temp = append(temp, info)                                           // https://github.com/golang/go/wiki/SliceTricks#filtering-without-allocating
+func checkTimeout() {
+	for {
+		select {
+		case event := <-channel_timeout:
+			switch event.t {
+			case 0: //error
+			case 1: //shutdown ( from console )
+				return
+			default:
+			}
+		default:
 		}
+		temp := server_list[:0]
+		for _, info := range server_list {
+			delta := time.Since(info.lastHeartbeat)
+			if delta.Milliseconds() <= SERVER_TIMEOUT {
+				temp = append(temp, info) // https://github.com/golang/go/wiki/SliceTricks#filtering-without-allocating
+			}
+		}
+		server_list = temp
 	}
-	server_list = temp
-	return nil
 }
 
-func processCmd() error {
+func processCmd() {
 	reader := bufio.NewReader(os.Stdin)
 	for {
+		select {
+		case event := <-channel_command:
+			switch event.t {
+			case 0: //error
+			case 1: //shutdown ( from console )
+				return
+			default:
+			}
+		default:
+		}
 		text, err := reader.ReadString('\n')
 		if err != nil {
-			return err
+			channel_event <- event{t: 0, err: err, sender: channel_command}
 		}
 		fmt.Println("Received: " + text + "\n") // UNQLSS: TODO
 	}
@@ -212,29 +262,62 @@ func initUdpSocket(address string, port int) error {
 	var addr *net.UDPAddr
 	addr, err = net.ResolveUDPAddr("udp", address+":"+strconv.Itoa(int(port)))
 	if err != nil {
+		channel_event <- event{t: 0, err: err, sender: channel_udp}
 		return err
 	}
 	socket, err = net.ListenUDP("udp", addr)
 	if err != nil {
+		channel_event <- event{t: 0, err: err, sender: channel_udp}
 		return err
 	}
 	return nil
 }
 
+func shutdownUdpSocket() error {
+	var err error
+	err = socket.Close()
+	return err
+}
+
 func StartDeamon(port uint16) error {
-	initUdpSocket("", 29060)
+	var err error
+	var running bool
+	err = initUdpSocket("", 29060)
+	if err != nil {
+		log.Printf("Faied to init udp socket: %s", err)
+		return err
+	}
 	go checkTimeout()
 	go processUdpPackets()
 	go processCmd()
-
-	for {
+	running = true
+	for running {
 		select {
 		case event := <-channel_event:
 			switch event.t {
 			case 0: //error
-				return event.err
+			case 1: //shutdown ( from console )
+				running = false
+				if event.sender == channel_command {
+					channel_timeout <- event
+					channel_udp <- event
+				}
+				if event.sender == channel_udp {
+					channel_timeout <- event
+					channel_command <- event
+				}
+				if event.sender == channel_timeout {
+					channel_command <- event
+					channel_udp <- event
+				}
 			}
 		default:
 		}
 	}
+	err = shutdownUdpSocket()
+	if err != nil {
+		log.Printf("Faied to shutdown udp socket: %s", err)
+		return err
+	}
+	return nil
 }
