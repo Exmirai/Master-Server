@@ -35,10 +35,16 @@ type event struct {
 	payload string
 }
 
+type list_request struct {
+	t       int // 0 - heartbeat, 2 - infoResponse, 3 - getServers
+	addr    *net.UDPAddr
+	payload []string
+}
+
 const MSG_MAXLEN = 1024
 const MAX_INFOSTRING = 1024
 const MAX_SERVERS = 1024
-const SERVER_TIMEOUT int64 = 303 * 1000 // msec
+const SERVER_TIMEOUT = 300 // sec
 
 var server_list = make([]server_info, 0, MAX_SERVERS)
 var socket *net.UDPConn
@@ -46,16 +52,18 @@ var socket *net.UDPConn
 var channel_event = make(chan event)
 var channel_command = make(chan event)
 var channel_udp = make(chan event)
-var channel_timeout = make(chan event)
+var channel_serverlist = make(chan event)
+
+var channel_listrequest = make(chan list_request)
 
 func sendUdpMessage(ip *net.UDPAddr, data []byte) error {
-	var buffer []byte = make([]byte, 4, MSG_MAXLEN)
+	var buffer []byte = make([]byte, 4)
 	buffer[0] = 255
 	buffer[1] = 255
 	buffer[2] = 255
 	buffer[3] = 255
 
-	buffer = append(buffer[:], data[:]...)
+	buffer = append(buffer, data...)
 	_, err := socket.WriteToUDP(buffer, ip)
 	if err != nil {
 		return err
@@ -93,26 +101,17 @@ func getInfo(server server_info) error {
 }
 
 func heartbeat(address *net.UDPAddr, data []string) error {
-	var err error
 	for index, v := range server_list {
 		if v.ip.String() == address.String() { // already have that server in list
 			server_list[index].lastHeartbeat = time.Now()
 			server_list[index].status = 1
-			err = getInfo(server_list[index])
-			if err != nil {
-				return err
-			}
-			return nil
+			return getInfo(server_list[index])
 		}
 	}
 	// Don't found any
 	info := server_info{ip: address, lastHeartbeat: time.Now(), challenge: "ch3114ng3", status: 1}
 	server_list = append(server_list, info)
-	err = getInfo(server_list[len(server_list)-1]) // getting last
-	if err != nil {
-		return err
-	}
-	return nil
+	return getInfo(server_list[len(server_list)-1])
 }
 
 func getserversResponse(ip *net.UDPAddr) error {
@@ -134,8 +133,7 @@ func getserversResponse(ip *net.UDPAddr) error {
 			output = append(output[:], []byte("\\")...)
 		}
 	}
-	sendUdpMessage(ip, output)
-	return nil
+	return sendUdpMessage(ip, output)
 }
 
 func getServers(address *net.UDPAddr, data []string) error {
@@ -202,11 +200,11 @@ func processUdpPackets() {
 		}
 		switch data[0] {
 		case "heartbeat":
-			heartbeat(address, data)
+			channel_listrequest <- list_request{t: 0, addr: address, payload: data}
 		case "getservers":
-			getServers(address, data)
+			channel_listrequest <- list_request{t: 2, addr: address, payload: data}
 		case "infoResponse":
-			infoResponse(address, data)
+			channel_listrequest <- list_request{t: 1, addr: address, payload: data}
 		default:
 			log.Printf("Received unknown message from %s : %s", address.String, buffer)
 		}
@@ -214,26 +212,14 @@ func processUdpPackets() {
 }
 
 func checkTimeout() {
-	for {
-		select {
-		case event := <-channel_timeout:
-			switch event.t {
-			case 0: //error
-			case 1: //shutdown ( from console )
-				return
-			default:
-			}
-		default:
+	temp := server_list[:0]
+	for _, info := range server_list {
+		delta := time.Since(info.lastHeartbeat)
+		if delta.Milliseconds() <= SERVER_TIMEOUT {
+			temp = append(temp, info) // https://github.com/golang/go/wiki/SliceTricks#filtering-without-allocating
 		}
-		temp := server_list[:0]
-		for _, info := range server_list {
-			delta := time.Since(info.lastHeartbeat)
-			if delta.Milliseconds() <= SERVER_TIMEOUT {
-				temp = append(temp, info) // https://github.com/golang/go/wiki/SliceTricks#filtering-without-allocating
-			}
-		}
-		server_list = temp
 	}
+	server_list = temp
 }
 
 func processCmd() {
@@ -254,6 +240,45 @@ func processCmd() {
 			channel_event <- event{t: 0, err: err, sender: channel_command}
 		}
 		fmt.Println("Received: " + text + "\n") // UNQLSS: TODO
+	}
+}
+
+func serverListWorker() {
+	timeout_ticker := time.Tick(SERVER_TIMEOUT * time.Second)
+	var err error
+	for {
+		select {
+		case <-timeout_ticker:
+			{
+				checkTimeout()
+			}
+		case request := <-channel_listrequest:
+			{
+				switch request.t {
+				case 0:
+					err = heartbeat(request.addr, request.payload)
+				case 1:
+					err = infoResponse(request.addr, request.payload)
+				case 2:
+					err = getServers(request.addr, request.payload)
+				default:
+					log.Printf("Unknown request")
+				}
+			}
+		case event := <-channel_serverlist:
+			{
+				switch event.t {
+				case 0: //error
+				case 1: //shutdown ( from console )
+					return
+				default:
+				}
+			}
+		}
+		if err != nil {
+			channel_event <- event{t: 0, err: err}
+			return
+		}
 	}
 }
 
@@ -287,9 +312,9 @@ func StartDeamon(port uint16) error {
 		log.Printf("Faied to init udp socket: %s", err)
 		return err
 	}
-	go checkTimeout()
 	go processUdpPackets()
 	go processCmd()
+	go serverListWorker()
 	running = true
 	for running {
 		select {
@@ -299,19 +324,18 @@ func StartDeamon(port uint16) error {
 			case 1: //shutdown ( from console )
 				running = false
 				if event.sender == channel_command {
-					channel_timeout <- event
+					channel_serverlist <- event
 					channel_udp <- event
 				}
 				if event.sender == channel_udp {
-					channel_timeout <- event
+					channel_serverlist <- event
 					channel_command <- event
 				}
-				if event.sender == channel_timeout {
+				if event.sender == channel_serverlist {
 					channel_command <- event
 					channel_udp <- event
 				}
 			}
-		default:
 		}
 	}
 	err = shutdownUdpSocket()
