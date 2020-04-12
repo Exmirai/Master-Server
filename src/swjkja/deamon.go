@@ -2,15 +2,17 @@ package swjkja
 
 import (
 	"bufio"
-	"log"
+	"errors"
+	"fmt"
+	"logging"
 	"net"
 	"os"
-
-	//	"rand"
-	"fmt"
+	"rand"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 type server_info struct {
@@ -29,7 +31,7 @@ type server_info struct {
 }
 
 type event struct {
-	t       int // 0 - error, 1 - shutdown
+	t       int // 0 - error, 1 - shutdown , 2 - info, 3 - warning
 	sender  chan event
 	err     error
 	payload string
@@ -45,6 +47,19 @@ const MSG_MAXLEN = 1024
 const MAX_INFOSTRING = 1024
 const MAX_SERVERS = 1024
 const SERVER_TIMEOUT = 300 // sec
+
+const (
+	EVENT_ERROR = iota
+	EVENT_SHUTDOWN
+	EVENT_LOG_INFO
+	EVENT_LOG_WARNING
+)
+
+const (
+	REQUEST_HEARTBEAT = iota
+	REQUEST_INFORESPONSE
+	REQUEST_GETSERVERS
+)
 
 var server_list = make([]server_info, 0, MAX_SERVERS)
 var socket *net.UDPConn
@@ -73,7 +88,7 @@ func sendUdpMessage(ip *net.UDPAddr, data []byte) error {
 
 func infoStringToMap(data string) (map[string]string, error) {
 	if len(data) > MAX_INFOSTRING {
-		return nil, nil //Warning should be there
+		return nil, errors.New("MAX_INFOSTRING limit exceeded\n")
 	}
 	if (strings.Index(data, "\\")) == 0 {
 		data = data[1:len(data)]
@@ -109,7 +124,8 @@ func heartbeat(address *net.UDPAddr, data []string) error {
 		}
 	}
 	// Don't found any
-	info := server_info{ip: address, lastHeartbeat: time.Now(), challenge: "ch3114ng3", status: 1}
+	challenge := rand.String(10)
+	info := server_info{ip: address, lastHeartbeat: time.Now(), challenge: challenge, status: 1}
 	server_list = append(server_list, info)
 	return getInfo(server_list[len(server_list)-1])
 }
@@ -144,7 +160,8 @@ func infoResponse(address *net.UDPAddr, data []string) error {
 	var err error
 	infostring, err := infoStringToMap(data[1])
 	if err != nil {
-		return err
+		channel_event <- event{t: EVENT_LOG_WARNING, payload: fmt.Sprintf("MAX_INFOSTRING limit exceeded. Dropping request")}
+		return nil
 	}
 	for index, info := range server_list {
 		if info.ip.IP.Equal(address.IP) && info.status == 1 {
@@ -175,8 +192,8 @@ func processUdpPackets() {
 		select {
 		case event := <-channel_udp:
 			switch event.t {
-			case 0: //error
-			case 1: //shutdown ( from console )
+			case EVENT_ERROR: //error
+			case EVENT_SHUTDOWN: //shutdown ( from console )
 				return
 			default:
 			}
@@ -184,7 +201,7 @@ func processUdpPackets() {
 		}
 		length, address, err := socket.ReadFromUDP(buffer)
 		if err != nil {
-			channel_event <- event{t: 0, err: err, sender: channel_udp}
+			channel_event <- event{t: EVENT_ERROR, err: err, sender: channel_udp}
 		}
 		raw := string(buffer[4:length])
 		length = length - 4
@@ -206,7 +223,7 @@ func processUdpPackets() {
 		case "infoResponse":
 			channel_listrequest <- list_request{t: 1, addr: address, payload: data}
 		default:
-			log.Printf("Received unknown message from %s : %s", address.String, buffer)
+			channel_event <- event{t: EVENT_LOG_INFO, payload: fmt.Sprintf("Unknown packet received from %s (%s)\n", address.String(), raw)}
 		}
 	}
 }
@@ -228,8 +245,8 @@ func processCmd() {
 		select {
 		case event := <-channel_command:
 			switch event.t {
-			case 0: //error
-			case 1: //shutdown ( from console )
+			case EVENT_ERROR: //error
+			case EVENT_SHUTDOWN: //shutdown ( from console )
 				return
 			default:
 			}
@@ -237,7 +254,7 @@ func processCmd() {
 		}
 		text, err := reader.ReadString('\n')
 		if err != nil {
-			channel_event <- event{t: 0, err: err, sender: channel_command}
+			channel_event <- event{t: EVENT_ERROR, err: err, sender: channel_command}
 		}
 		fmt.Println("Received: " + text + "\n") // UNQLSS: TODO
 	}
@@ -255,21 +272,21 @@ func serverListWorker() {
 		case request := <-channel_listrequest:
 			{
 				switch request.t {
-				case 0:
+				case REQUEST_HEARTBEAT:
 					err = heartbeat(request.addr, request.payload)
-				case 1:
+				case REQUEST_INFORESPONSE:
 					err = infoResponse(request.addr, request.payload)
-				case 2:
+				case REQUEST_GETSERVERS:
 					err = getServers(request.addr, request.payload)
 				default:
-					log.Printf("Unknown request")
+					channel_event <- event{t: 3, payload: fmt.Sprintf("Received unknown request ( %d )", request.t)}
 				}
 			}
 		case event := <-channel_serverlist:
 			{
 				switch event.t {
-				case 0: //error
-				case 1: //shutdown ( from console )
+				case EVENT_ERROR: //error
+				case EVENT_SHUTDOWN: //shutdown ( from console )
 					return
 				default:
 				}
@@ -287,12 +304,12 @@ func initUdpSocket(address string, port int) error {
 	var addr *net.UDPAddr
 	addr, err = net.ResolveUDPAddr("udp", address+":"+strconv.Itoa(int(port)))
 	if err != nil {
-		channel_event <- event{t: 0, err: err, sender: channel_udp}
+		channel_event <- event{t: EVENT_ERROR, err: err, sender: channel_udp}
 		return err
 	}
 	socket, err = net.ListenUDP("udp", addr)
 	if err != nil {
-		channel_event <- event{t: 0, err: err, sender: channel_udp}
+		channel_event <- event{t: EVENT_ERROR, err: err, sender: channel_udp}
 		return err
 	}
 	return nil
@@ -304,24 +321,34 @@ func shutdownUdpSocket() error {
 	return err
 }
 
-func StartDeamon(port uint16) error {
+func StartDeamon(port int) error {
 	var err error
+	var logger *logrus.Logger
 	var running bool
-	err = initUdpSocket("", 29060)
+
+	logger, err = logging.CreateLogger("log")
 	if err != nil {
-		log.Printf("Faied to init udp socket: %s", err)
+		fmt.Print(err)
+	}
+
+	err = initUdpSocket("", port)
+	if err != nil {
+		logger.Printf("Faied to init udp socket: %s", err)
 		return err
 	}
 	go processUdpPackets()
 	go processCmd()
 	go serverListWorker()
 	running = true
+	logger.Printf("Running UDP Server on port %d\n", port)
 	for running {
 		select {
 		case event := <-channel_event:
 			switch event.t {
-			case 0: //error
-			case 1: //shutdown ( from console )
+			case EVENT_ERROR: //error
+				logger.Error(err)
+			case EVENT_SHUTDOWN: //shutdown ( from console )
+				logger.Info("Shutdowning server...\n")
 				running = false
 				if event.sender == channel_command {
 					channel_serverlist <- event
@@ -335,12 +362,16 @@ func StartDeamon(port uint16) error {
 					channel_command <- event
 					channel_udp <- event
 				}
+			case EVENT_LOG_INFO:
+				logger.Info(event.payload)
+			case EVENT_LOG_WARNING:
+				logger.Warning(event.payload)
 			}
 		}
 	}
 	err = shutdownUdpSocket()
 	if err != nil {
-		log.Printf("Faied to shutdown udp socket: %s", err)
+		logger.Printf("Faied to shutdown udp socket: %s", err)
 		return err
 	}
 	return nil
